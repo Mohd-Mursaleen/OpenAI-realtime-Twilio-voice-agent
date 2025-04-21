@@ -29,6 +29,7 @@ class OpenAIWebSocketClient:
         }
         self._message_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self._connected = False
+        self._json_encoder = json.JSONEncoder()  # Cache encoder for performance
         
     def reset_state(self):
         """Reset the client state but keep the connection open"""
@@ -84,37 +85,15 @@ class OpenAIWebSocketClient:
 
     def _get_session_config(self) -> Dict[str, Any]:
         """Get the session configuration dictionary with hardcoded tools."""
-        # Hardcoded tools
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_current_weather",
-                    "description": "Get the current weather in a given location",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "location": {
-                                "type": "string",
-                                "description": "The city and state, e.g. San Francisco, CA"
-                            },
-                            "unit": {
-                                "type": "string",
-                                "enum": ["celsius", "fahrenheit"]
-                            }
-                        },
-                        "required": ["location"]
-                    }
-                }
-            }
-        ]
+        # Hardcoded tools - simplify for now
+        tools = []  # Removing tools to simplify troubleshooting
         
-        # Default prompt instead of dynamic one
+        # Improved prompt for better voice agent behavior
         default_prompt = """
-        You are an AI assistant that helps users with their questions and tasks.
-        You can provide information, assist with tasks, and have friendly conversations.
-        If asked about the weather, use the get_current_weather tool to fetch accurate information.
-        Be concise, helpful, and friendly in your responses.
+        You are a friendly phone assistant. When a call connects, greet the caller warmly.
+        Keep your responses brief and natural.
+        This is a phone conversation, so be conversational and engaging.
+        Speak in a way that feels natural for a phone call.
         """
         
         config = {
@@ -126,9 +105,8 @@ class OpenAIWebSocketClient:
                 "voice": VOICE,
                 "instructions": default_prompt,
                 "modalities": ["text", "audio"],
-                "temperature": 6,
+                "temperature": 0.7,  # Slightly higher temperature for more natural responses
                 "tools": tools,
-                "tool_choice": "auto",
                 "model": "gpt-4o-mini-realtime-preview-2024-12-17"
             }
         }
@@ -147,13 +125,19 @@ class OpenAIWebSocketClient:
             self._connected = False
             raise ConnectionClosed(self.websocket.close_code or 1006, "Connection is closed")
         
+        # Log specific message types with appropriate levels
+        if isinstance(message, dict):
+            message_type = message.get('type', 'unknown')
+            if message_type == 'conversation.item.create':
+                logger.info(f"Sending conversation.item.create")
+            elif message_type == 'response.create':
+                logger.info(f"Requesting response from OpenAI")
+            elif message_type != 'input_audio_buffer.append':
+                logger.debug(f"Sending message of type: {message_type}")
+        
         # For audio data, optimize sending with minimal overhead
         if isinstance(message, dict) and message.get('type') == 'input_audio_buffer.append':
             try:
-                # Cache JSON serialization for audio messages to reduce overhead
-                if not hasattr(self, '_json_encoder'):
-                    self._json_encoder = json.JSONEncoder()
-                
                 # Use the cached encoder for faster serialization
                 serialized = self._json_encoder.encode(message)
                 await self.websocket.send(serialized)
@@ -166,9 +150,6 @@ class OpenAIWebSocketClient:
         # For non-audio messages, use standard handling
         try:
             if isinstance(message, dict):
-                message_type = message.get('type', 'unknown')
-                if message_type != 'input_audio_buffer.append':
-                    logger.debug(f"Sending message of type: {message_type}")
                 await self.websocket.send(json.dumps(message))
             else:
                 await self.websocket.send(message)
@@ -192,6 +173,25 @@ class OpenAIWebSocketClient:
                     # Call the callback if set
                     if self._message_callback and parsed_message:
                         self._message_callback(parsed_message)
+                    
+                    # Enhanced logging for important message types
+                    msg_type = parsed_message.get('type', 'unknown')
+                    if msg_type == 'response.audio.delta':
+                        # This indicates audio is being received
+                        if not hasattr(self, '_audio_chunks_received'):
+                            self._audio_chunks_received = 0
+                            logger.info("Receiving first audio data from OpenAI")
+                        self._audio_chunks_received = getattr(self, '_audio_chunks_received', 0) + 1
+                        if self._audio_chunks_received % 100 == 0:
+                            logger.info(f"Received {self._audio_chunks_received} audio chunks from OpenAI")
+                    elif msg_type in ['session.created', 'session.updated']:
+                        logger.info(f"Session {msg_type.split('.')[1]} successfully")
+                    elif msg_type == 'error':
+                        error_msg = parsed_message.get('error', {}).get('message', 'Unknown error')
+                        logger.error(f"OpenAI error: {error_msg}")
+                    elif msg_type == 'response.created':
+                        logger.info("OpenAI is generating a response")
+                    
                     return parsed_message
                 except json.JSONDecodeError:
                     logger.error("Failed to parse JSON message")

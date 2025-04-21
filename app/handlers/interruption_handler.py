@@ -6,10 +6,10 @@ import logging
 from fastapi import WebSocket
 
 # handlers imports
-from app.agent.handlers.stream_state import StreamState
+from app.handlers.stream_state import StreamState
 
 # client import
-from app.agent.client import OpenAIWebSocketClient
+from app.client.client import OpenAIWebSocketClient
 
 logger = logging.getLogger(__name__)
 

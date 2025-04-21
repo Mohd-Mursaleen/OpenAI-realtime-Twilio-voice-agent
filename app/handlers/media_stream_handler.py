@@ -1,10 +1,14 @@
 import logging
 import json
 import base64
+import asyncio
 from typing import Dict, Any, Callable, Optional
 from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect
 from app.handlers.stream_state import StreamState
 from app.client.client import OpenAIWebSocketClient
+from app.handlers.twilio_handler import TwilioMessageHandler
+from app.handlers.openai_handler import OpenAIMessageHandler
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,6 @@ class MediaStreamHandler:
             Exception: If any error occurs during the connection handling process
         """
         logger.info("Client connected")
-        await self.websocket.accept()
         
         # Send initial status
         await self.websocket.send_json({
@@ -67,7 +70,7 @@ class MediaStreamHandler:
         """
         logger.info("Cleaning up connection")
         if self.openai_client.connected:
-            self.openai_client.close()
+            await self.openai_client.close()
 
     async def _receive_from_twilio(self):
         """Handles incoming messages from Twilio's WebSocket connection.
@@ -109,7 +112,7 @@ class MediaStreamHandler:
                     break
                 
                 try:
-                    response = self.openai_client.receive_message()
+                    response = await self.openai_client.receive_message()
                     response_type = response.get('type', 'unknown')
                     logger.debug(f"Processing OpenAI message type: {response_type}")
                     await self.openai_handler.process_response(response)
@@ -123,7 +126,7 @@ class MediaStreamHandler:
             raise
 
 
-async def handle_media_stream(websocket: WebSocket):
+async def handle_media_stream(websocket: WebSocket, openai_client: OpenAIWebSocketClient):
     """Entry point for handling WebSocket connections.
     
     Creates a new MediaStreamHandler instance and initiates the connection
@@ -131,9 +134,10 @@ async def handle_media_stream(websocket: WebSocket):
 
     Args:
         websocket (WebSocket): The incoming WebSocket connection from Twilio
+        openai_client (OpenAIWebSocketClient): Client for communicating with OpenAI's API
 
     Returns:
         None
     """
-    handler = MediaStreamHandler(websocket, OpenAIWebSocketClient())
+    handler = MediaStreamHandler(websocket, openai_client)
     await handler.handle_connection()

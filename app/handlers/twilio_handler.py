@@ -8,10 +8,10 @@ import asyncio
 from fastapi import WebSocket
 
 # handlers imports
-from app.agent.handlers.stream_state import StreamState
+from app.handlers.stream_state import StreamState
 
 # Remove the circular import
-# from app.agent.client import OpenAIWebSocketClient
+# from app.client.client import OpenAIWebSocketClient
 
 logger = logging.getLogger(__name__)
 
@@ -145,10 +145,16 @@ class TwilioMessageHandler:
         """Handles the end of a media stream."""
         try:
             logger.info(f"Stream ending: {self.state.stream_sid}")
-            # Send end of stream marker to OpenAI
-            await self.openai_client.send({
-                "type": "input_audio_buffer.end"
-            })
+            
+            # Only send commit if we've actually received media data
+            if self.state.media_count > 0:
+                logger.info(f"Sending input_audio_buffer.commit after {self.state.media_count} media chunks")
+                # Send end of stream marker to OpenAI
+                await self.openai_client.send({
+                    "type": "input_audio_buffer.commit"
+                })
+            else:
+                logger.warning("No audio data received, skipping input_audio_buffer.commit")
             
             # Following the twilio-realtime-main approach:
             # Do NOT force a response at the end of the call

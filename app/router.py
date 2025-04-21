@@ -7,9 +7,15 @@ import traceback
 from typing import Dict
 from starlette.websockets import WebSocketDisconnect
 import time
+import asyncio
+from websockets.exceptions import ConnectionClosed
 from app.client.pool_instance import client_pool
 from app.handlers.media_stream_handler import handle_media_stream
+from app.handlers.stream_state import StreamState
+from app.handlers.twilio_handler import TwilioMessageHandler
+from app.handlers.openai_handler import OpenAIMessageHandler
 from twilio.rest import Client
+import json
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -110,10 +116,125 @@ async def websocket_endpoint(
         await websocket.close(code=1013, reason="No available OpenAI clients")
         return
     
+    # Create stream state
+    state = StreamState()
+    
+    # Initialize handlers
+    twilio_handler = TwilioMessageHandler(websocket, state, openai_client)
+    openai_handler = OpenAIMessageHandler(websocket, state, openai_client)
+    
     try:
         logger.info("Starting media stream handling")
-        # Handle the media stream
-        await handle_media_stream(websocket, openai_client)
+        
+        # Send confirmation to client
+        await websocket.send_json({
+            "event": "connection_ready",
+            "message": "OpenAI client connected and ready to receive audio"
+        })
+        
+        # Wait for the START event from Twilio before triggering a greeting
+        # This ensures we have an established stream SID
+        wait_for_start = True
+        
+        # Main message handling loop
+        async def receive_from_twilio():
+            nonlocal wait_for_start
+            try:
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    event_type = data.get('event', 'unknown')
+                    
+                    # Send acknowledgment for media events
+                    if event_type == 'media':
+                        await websocket.send_json({
+                            "event": "media_ack",
+                            "streamSid": data.get("streamSid", "")
+                        })
+                    
+                    # Process the message
+                    await twilio_handler.process_message(data)
+                    
+                    # If we received the start event and were waiting for it,
+                    # trigger the greeting after a short delay to allow setup
+                    if wait_for_start and event_type == 'start':
+                        wait_for_start = False
+                        # Use create_task to not block message processing
+                        asyncio.create_task(trigger_delayed_greeting(openai_client))
+                        
+            except WebSocketDisconnect:
+                logger.info("Client disconnected")
+            except Exception as e:
+                logger.error(f"Error in receive_from_twilio: {e}")
+                raise
+        
+        async def trigger_delayed_greeting(client):
+            """Send a greeting with slight delay to ensure stream is established"""
+            try:
+                # Wait for stream to stabilize
+                await asyncio.sleep(1.0)
+                
+                logger.info("Triggering initial agent greeting")
+                # Send a simple user message to trigger the assistant
+                await client.send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Hi there"
+                            }
+                        ],
+                        "role": "user"
+                    }
+                })
+                
+                # Wait a bit before requesting a response
+                await asyncio.sleep(0.5)
+                
+                # Request response
+                await client.send({
+                    "type": "response.create"
+                })
+                logger.info("Initial greeting request sent")
+            except Exception as e:
+                logger.error(f"Error in delayed greeting: {e}", exc_info=True)
+        
+        async def process_openai_messages():
+            try:
+                while True:
+                    if not openai_client.connected:
+                        logger.warning("OpenAI client disconnected")
+                        break
+                    
+                    try:
+                        # More aggressive polling
+                        for _ in range(5):  # Process multiple messages if available
+                            try:
+                                response = await asyncio.wait_for(
+                                    openai_client.receive_message(),
+                                    timeout=0.01  # Short timeout for more responsive polling
+                                )
+                                await openai_handler.process_response(response)
+                            except asyncio.TimeoutError:
+                                # No more messages available
+                                break
+                            except ConnectionClosed:
+                                logger.error("OpenAI connection closed")
+                                return
+                    except Exception as e:
+                        logger.error(f"Error processing OpenAI message: {e}")
+                    
+                    await asyncio.sleep(0.01)  # Prevent CPU spinning but keep responsive
+            except Exception as e:
+                logger.error(f"Error in process_openai_messages: {e}")
+                raise
+        
+        # Run both tasks concurrently
+        await asyncio.gather(
+            receive_from_twilio(),
+            process_openai_messages()
+        )
         
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
@@ -138,8 +259,8 @@ async def initiate_call(request: Request, x_api_key: str = Header(..., descripti
     Initiate an outbound call using Twilio.
     
     Request body should contain:
-    - to_number: The phone number to call
-    - from_number: Optional phone number to call from (uses default if not provided)
+    - to_number or to_phone_number: The phone number to call
+    - from_number or from_phone_number: Optional phone number to call from (uses default if not provided)
     """
     # Simple API key check
     api_key = os.environ.get("API_KEY")
@@ -151,8 +272,9 @@ async def initiate_call(request: Request, x_api_key: str = Header(..., descripti
     
     try:
         data = await request.json()
-        to_number = data.get("to_phone_number")
-        from_number = data.get("from_phone_number", TWILIO_PHONE_NUMBER)
+        # Support both field naming conventions
+        to_number = data.get("to_number") or data.get("to_phone_number")
+        from_number = data.get("from_number") or data.get("from_phone_number", TWILIO_PHONE_NUMBER)
         
         if not to_number:
             raise HTTPException(status_code=400, detail="to_number is required")
