@@ -1,24 +1,18 @@
 # built-in imports
 import json
-import base64
 import logging
 import asyncio
-import traceback
-import time
 
 # fastapi imports
 from fastapi import WebSocket
 
 # handlers imports
 from app.handlers.stream_state import StreamState
-from app.handlers.interruption_handler import InterruptionHandler
 from app.handlers.tools.tool_response import send_tool_result
 
 
 # client import
 from app.client.client import OpenAIWebSocketClient
-
-# config import
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +20,10 @@ class OpenAIMessageHandler:
     """Handles responses from OpenAI.
     
     This class processes responses from the OpenAI API, managing audio deltas,
-    speech events, and coordinating the response flow back to Twilio.
+    speech events, and coordinating the response flow to the client.
 
     Attributes:
-        websocket (WebSocket): The WebSocket connection to Twilio
+        websocket (WebSocket): The WebSocket connection to the client
         state (StreamState): The current state of the media stream
         openai_client (OpenAIWebSocketClient): Client for communicating with OpenAI's API
     """
@@ -50,10 +44,6 @@ class OpenAIMessageHandler:
                 logger.warning("Response missing type field")
                 return
 
-            # Only log non-audio response types to reduce overhead
-            # if response_type != 'response.audio.delta':
-            #     logger.info(f"Processing response type: {response_type}")
-
             if response_type == 'session.created' or response_type == 'session.updated':
                 logger.info(f"Session {response_type.split('.')[1]} successfully")
             elif response_type == 'response.audio.delta':
@@ -64,18 +54,11 @@ class OpenAIMessageHandler:
                 await self._handle_speech_stopped()
             elif response_type == 'response.text.delta':
                 await self._handle_text_delta(response)
-            # Add explicit handling for function call start
             elif response_type == 'response.function_call.start':
                 logger.info(f"Function call started: {response.get('function_call', {}).get('name', 'unknown')}")
-            # Add explicit handling for function call arguments delta
             elif response_type == 'response.function_call.arguments.delta':
                 logger.debug(f"Function call arguments delta: {response.get('delta', {})}")
-            # More visible logging for function call completion
             elif response_type == 'response.function_call_arguments.done':
-                logger.info(f"Function call arguments done, processing now...")
-                # Log the full message for debugging
-                logger.info(f"Function call details: {json.dumps(response)}")
-                # Also print directly to console for immediate debugging
                 await self._handle_function_call(response)
             elif response_type == 'error':
                 await self._handle_error(response)
@@ -91,7 +74,10 @@ class OpenAIMessageHandler:
             text = response.get('text', '')
             if text:
                 logger.info(f"Transcript: {text}")
-                # You can add additional handling here if needed
+                await self.websocket.send_json({
+                    "type": "transcript",
+                    "text": text
+                })
         except Exception as e:
             logger.error(f"Error handling transcript: {e}", exc_info=True)
 
@@ -114,55 +100,33 @@ class OpenAIMessageHandler:
             if self._audio_chunk_count % 100 == 0:
                 logger.info(f"Processed {self._audio_chunk_count} audio chunks")
                 
-            # Send the audio data to Twilio
+            # Send the audio data to client
             await self.websocket.send_json({
-                "event": "media",
-                "streamSid": self.state.stream_sid,
-                "media": {
-                    "payload": audio_data  # Already base64 encoded
-                }
+                "type": "audio",
+                "audio": audio_data  # Already base64 encoded
             })
             
             if response.get('item_id'):
                 self.state.last_assistant_item = response['item_id']
 
-            if self.state.response_start_timestamp_twilio is None:
-                self._set_response_start_timestamp()
-
-            await self._send_mark()
+            if self.state.response_start_time is None:
+                self.state.response_start_time = self.state.latest_timestamp
             
         except Exception as e:
             logger.error(f"Error handling audio delta: {e}", exc_info=True)
 
     async def _handle_speech_started(self):
-        """Handles detection of user starting to speak.
-        
-        Logs the speech start event and initiates interruption handling if there's 
-        an ongoing assistant response. Sends clear event to Twilio and resets state.
-
-        Returns:
-            None
-        """
+        """Handles detection of user starting to speak."""
         try:
             logger.info("Speech started detected")
             
             # If there's an ongoing response, handle interruption
-            if self.state.mark_queue and self.state.response_start_timestamp_twilio is not None:
+            if self.state.is_assistant_speaking:
                 logger.info("Interruption detected, handling...")
-                await InterruptionHandler(self.websocket, self.state, self.openai_client).handle()
-                
-                # Send clear event to Twilio
-                await self.websocket.send_json({
-                    "event": "clear",
-                    "streamSid": self.state.stream_sid
-                })
-                
-                # Reset state
-                self.state.mark_queue.clear()
-                self.state.last_assistant_item = None
-                self.state.response_start_timestamp_twilio = None
+                await self._handle_interruption()
             
-            self.state.response_start_timestamp_twilio = self.state.latest_media_timestamp
+            self.state.is_user_speaking = True
+            self.state.latest_timestamp = self.state.get_current_timestamp()
 
         except Exception as e:
             logger.error(f"Error handling speech started: {e}", exc_info=True)
@@ -171,33 +135,34 @@ class OpenAIMessageHandler:
         """Handles detection of user stopping speech."""
         try:
             logger.info("Speech stopped detected")
-                
-            # Following the twilio-realtime-main approach:
-            # Do NOT request a response after speech ends
-            # Let OpenAI decide when to respond naturally
-            logger.info("Not requesting a response after speech stopped - letting OpenAI respond naturally")
+            self.state.is_user_speaking = False
             
         except Exception as e:
             logger.error(f"Error handling speech stopped: {e}", exc_info=True)
 
-    async def _request_response_with_retry(self, max_retries=3, delay=1.0):
-        """Request a response from OpenAI with retries."""
-        for attempt in range(1, max_retries + 1):
-            try:
-                logger.info(f"Requesting response from OpenAI after speech ended (attempt {attempt}/{max_retries})")
-                await self.openai_client.send({
-                    "type": "response.create"
-                })
-                logger.info("Response request sent to OpenAI")
-                return True
-            except Exception as e:
-                logger.error(f"Error requesting response (attempt {attempt}/{max_retries}): {e}", exc_info=True)
-                if attempt < max_retries:
-                    logger.info(f"Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                    
-        logger.error(f"Failed to request response after {max_retries} attempts")
-        return False
+    async def _handle_interruption(self):
+        """Handles interruption of assistant's speech."""
+        try:
+            if self.state.last_assistant_item:
+                # Calculate elapsed time
+                elapsed_time = self.state.get_current_timestamp() - self.state.response_start_time
+                
+                # Send truncate event to OpenAI
+                truncate_event = {
+                    "type": "conversation.item.truncate",
+                    "item_id": self.state.last_assistant_item,
+                    "content_index": 0,
+                    "audio_end_ms": elapsed_time
+                }
+                await self.openai_client.send(truncate_event)
+                
+                # Reset state
+                self.state.last_assistant_item = None
+                self.state.response_start_time = None
+                self.state.is_assistant_speaking = False
+                
+        except Exception as e:
+            logger.error(f"Error handling interruption: {e}", exc_info=True)
 
     async def _handle_text_delta(self, response: dict):
         """Handle text delta responses from OpenAI."""
@@ -205,21 +170,23 @@ class OpenAIMessageHandler:
             text = response.get('text', '')
             if text:
                 logger.info(f"Assistant: {text}")
+                await self.websocket.send_json({
+                    "type": "text",
+                    "text": text
+                })
         except Exception as e:
             logger.error(f"Error handling text delta: {e}", exc_info=True)
 
     async def _handle_function_call(self, response: dict):
-        """Handle function call responses from OpenAI (simplified placeholder)."""
+        """Handle function call responses from OpenAI."""
         try:
             logger.info(f"Function call received: {response.get('type')}")
             
-            # Extract basic function info - simplified for now
             function_name = response.get('name')
             call_id = response.get('call_id')
             
             logger.info(f"Function call from realtime API - Name: {function_name}, ID: {call_id}")
             
-            # Send a simple placeholder result
             if call_id:
                 result = {
                     "status": "success",
@@ -240,44 +207,9 @@ class OpenAIMessageHandler:
             error_msg = response.get('error', {}).get('message', 'Unknown error')
             logger.error(f"OpenAI error: {error_msg}")
             
-            # Notify Twilio of the error
             await self.websocket.send_json({
-                "event": "error",
-                "streamSid": self.state.stream_sid,
+                "type": "error",
                 "message": error_msg
             })
         except Exception as e:
             logger.error(f"Error handling error response: {e}", exc_info=True)
-
-    def _set_response_start_timestamp(self):
-        """Records the timestamp when assistant starts responding.
-        
-        Updates state with current media timestamp and optionally logs timing
-        information if debug flag is enabled.
-
-        Returns:
-            None
-        """
-        self.state.response_start_timestamp_twilio = self.state.latest_media_timestamp
-
-    async def _send_mark(self):
-        """Sends a mark event to Twilio for response synchronization.
-        
-        Creates and sends a mark event if stream ID exists, and adds
-        the mark to the state's queue for tracking.
-
-        Returns:
-            None
-        """
-        if self.state.stream_sid:
-            try:
-                mark_event = {
-                    "event": "mark",
-                    "streamSid": self.state.stream_sid,
-                    "mark": {"name": "responsePart"}
-                }
-                await self.websocket.send_json(mark_event)
-                self.state.mark_queue.append('responsePart')
-                logger.debug("Sent mark event")
-            except Exception as e:
-                logger.error(f"Error sending mark: {e}", exc_info=True)

@@ -1,11 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import os
 import logging
 import sys
 from contextlib import asynccontextmanager
 from app.client.pool_instance import client_pool, schedule_health_check
-from app.db.database import initialize_supabase
 from app.router import router as agent_router
 
 # Configure logging
@@ -25,7 +25,6 @@ async def lifespan(app: FastAPI):
     # Startup events
     try:
         logger.info("Starting up Voice Agent API...")
-        initialize_supabase()
         
         # Pre-initialize the client pool - await it to ensure completion
         logger.info("Initializing OpenAI client pool...")
@@ -57,21 +56,22 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(
     title="Voice Agent API",
-    description="Voice agent services for handling voice interactions using OpenAI and Twilio",
+    description="Voice agent services for handling voice interactions using OpenAI",
     version="1.0.0",
     lifespan=lifespan,
 )
-
-# Configure CORS
+logger.info("Adding CORS middleware...")
+# Configure CORS - Simple configuration for development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
+logger.info("CORS middleware added successfully")
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Include the Agent API routes
 app.include_router(agent_router, tags=["agent"])
@@ -88,4 +88,4 @@ def main():
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, log_level="info")
 
 if __name__ == "__main__":
-    main() 
+    main()
