@@ -17,23 +17,6 @@ logger = logging.getLogger(__name__)
 # Initialize API router
 router = APIRouter()
 
-@router.get("/voice-agent", response_class=HTMLResponse)
-async def agent_status():
-    """Returns the status of the voice agent service."""
-    return HTMLResponse(
-        content="""
-        <html>
-            <head>
-                <title>Voice Agent</title>
-            </head>
-            <body>
-                <h1>Voice Agent</h1>
-                <p>The voice agent service is running.</p>
-            </body>
-        </html>
-        """
-    )
-
 @router.websocket("/audio-stream")
 async def websocket_endpoint(websocket: WebSocket):
     """Handle WebSocket connection for audio streaming directly to OpenAI."""
@@ -70,25 +53,34 @@ async def websocket_endpoint(websocket: WebSocket):
             "message": "OpenAI client connected and ready to receive audio"
         })
         
+        logger.info("WebSocket connection established and OpenAI client ready")
+        
         # Main message handling loop
         async def receive_audio():
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
+                    message_type = data.get('type')
+                    
+                    logger.debug(f"Received message type: {message_type}")
                     
                     # Handle different message types
-                    if data.get('type') == 'audio':
-                        # Forward audio data to OpenAI
+                    if message_type == 'audio':
+                        # Forward audio data to OpenAI in the correct format
                         await openai_client.send({
                             "type": "input_audio_buffer.append",
-                            "audio": data['audio']  # Expecting base64 encoded audio
+                            "audio": data['audio']  # base64 encoded audio from client
                         })
-                    elif data.get('type') == 'start_speaking':
+                        logger.debug("Forwarded audio data to OpenAI")
+                        
+                    elif message_type == 'start_speaking':
                         # Handle when user starts speaking
                         await openai_client.send({
                             "type": "input_audio_buffer.start"
                         })
-                    elif data.get('type') == 'end_speaking':
+                        logger.info("Sent start speaking to OpenAI")
+                        
+                    elif message_type == 'end_speaking':
                         # Handle when user stops speaking
                         await openai_client.send({
                             "type": "input_audio_buffer.commit"
@@ -97,6 +89,35 @@ async def websocket_endpoint(websocket: WebSocket):
                         await openai_client.send({
                             "type": "response.create"
                         })
+                        logger.info("Committed audio buffer and requested response")
+                        
+                    elif message_type == 'session.create':
+                        # Client is requesting session creation - this is handled automatically
+                        logger.info("Client requested session creation (handled automatically)")
+                        
+                    elif message_type == 'input_audio_buffer.commit':
+                        # Forward commit request to OpenAI
+                        await openai_client.send({
+                            "type": "input_audio_buffer.commit"
+                        })
+                        logger.info("Committed audio buffer")
+                        
+                    elif message_type == 'response.create':
+                        # Forward response creation request to OpenAI
+                        await openai_client.send({
+                            "type": "response.create"
+                        })
+                        logger.info("Requested response from OpenAI")
+                        
+                    elif message_type == 'input_audio_buffer.clear':
+                        # Forward clear request to OpenAI
+                        await openai_client.send({
+                            "type": "input_audio_buffer.clear"
+                        })
+                        logger.info("Cleared audio buffer")
+                        
+                    else:
+                        logger.warning(f"Unhandled message type from client: {message_type}")
                         
             except WebSocketDisconnect:
                 logger.info("Client disconnected")

@@ -99,13 +99,18 @@ class OpenAIWebSocketClient:
         config = {
             "type": "session.update",
             "session": {
-                "turn_detection": {"type": "server_vad"},
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 200
+                },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": VOICE,
                 "instructions": default_prompt,
                 "modalities": ["text", "audio"],
-                "temperature": 0.7,  # Slightly higher temperature for more natural responses
+                "temperature": 0.7,
                 "tools": tools,
                 "model": "gpt-4o-mini-realtime-preview-2024-12-17"
             }

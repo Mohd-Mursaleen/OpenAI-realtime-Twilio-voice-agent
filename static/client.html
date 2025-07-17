@@ -84,12 +84,25 @@
             margin-right: 20%;
             margin-left: 5px;
         }
+        .system-message {
+            background-color: #fff3cd;
+            margin: 0 10%;
+            text-align: center;
+            font-style: italic;
+        }
         .visualizer {
             height: 60px;
             width: 100%;
             margin: 10px 0;
             background-color: #000;
             border-radius: 5px;
+        }
+        .audio-status {
+            margin: 10px 0;
+            padding: 8px;
+            background-color: #e9ecef;
+            border-radius: 5px;
+            font-size: 14px;
         }
     </style>
 </head>
@@ -101,9 +114,12 @@
         <div class="controls">
             <button id="recordButton">Start Recording</button>
             <button id="connectButton">Connect</button>
+            <button id="clearButton">Clear Transcript</button>
         </div>
 
         <canvas id="visualizer" class="visualizer"></canvas>
+        
+        <div class="audio-status" id="audioStatus">Audio Queue: 0 | Playing: No</div>
         
         <div class="transcript" id="transcript"></div>
     </div>
@@ -116,12 +132,42 @@
         let isRecording = false;
         let isConnected = false;
         
+        // Audio buffering system
+        let audioBufferQueue = [];
+        let isAudioPlaying = false;
+        let currentAudioSource = null;
+        const BUFFER_LOW_THRESHOLD = 2;
+        const BUFFER_HIGH_THRESHOLD = 10;
+        const BUFFER_PADDING_MS = 50;
+        let lastPlayedTime = 0;
+        let consecutiveEmptyBuffers = 0;
+        let audioChunkCount = 0;
+        let droppedChunkCount = 0;
+        
+        // For advanced buffering
+        let audioBufferCache = null;
+        const MERGE_THRESHOLD = 4;
+        const MIN_CHUNK_DURATION = 0.1;
+        
+        // For speech pattern detection
+        let lastAudioReceived = 0;
+        let isBuffering = false;
+        let silenceDetected = false;
+        const SPEECH_GAP_THRESHOLD = 1000;
+        
         const recordButton = document.getElementById('recordButton');
         const connectButton = document.getElementById('connectButton');
+        const clearButton = document.getElementById('clearButton');
         const statusDiv = document.getElementById('status');
         const transcriptDiv = document.getElementById('transcript');
+        const audioStatusDiv = document.getElementById('audioStatus');
         const visualizer = document.getElementById('visualizer');
         const canvasCtx = visualizer.getContext('2d');
+
+        // Update audio status display
+        function updateAudioStatus() {
+            audioStatusDiv.textContent = `Audio Queue: ${audioBufferQueue.length} | Playing: ${isAudioPlaying ? 'Yes' : 'No'}`;
+        }
 
         // Set up WebSocket connection
         connectButton.addEventListener('click', () => {
@@ -155,6 +201,14 @@
                 statusDiv.textContent = 'Connected';
                 statusDiv.className = 'status connected';
                 connectButton.textContent = 'Disconnect';
+                // Create a new session when connected
+                ws.send(JSON.stringify({ 
+                    type: 'session.create',
+                    data: {
+                        mode: "text" // or "speech" if you want spoken responses
+                    }
+                }));
+                addMessage('system', 'Connected to voice agent');
             };
             
             ws.onclose = () => {
@@ -162,6 +216,8 @@
                 statusDiv.textContent = 'Disconnected';
                 statusDiv.className = 'status disconnected';
                 connectButton.textContent = 'Connect';
+                clearAudioQueue();
+                addMessage('system', 'Disconnected from voice agent');
             };
             
             ws.onmessage = handleWebSocketMessage;
@@ -170,21 +226,43 @@
         // Handle incoming messages
         function handleWebSocketMessage(event) {
             const data = JSON.parse(event.data);
+            console.log('Received message:', data.type || data.event);
             
-            switch(data.type) {
+            switch(data.type || data.event) {
                 case 'text':
-                    addMessage('assistant', data.text);
+                case 'response':
+                    if (data.text) {
+                        addMessage('assistant', data.text);
+                    }
+                    if (data.audio) {
+                        console.log('Received audio data, length:', data.audio.length);
+                        playAudio(data.audio);
+                    }
                     break;
                 case 'transcript':
                     addMessage('user', data.text);
                     break;
                 case 'audio':
+                    console.log('Received audio data, length:', data.audio ? data.audio.length : 0);
                     playAudio(data.audio);
+                    break;
+                case 'interruption':
+                case 'start_interruption':
+                    // Clear audio queue on interruption
+                    clearAudioQueue();
+                    console.log('Interruption detected, cleared audio queue');
+                    addMessage('system', 'Audio interrupted');
                     break;
                 case 'error':
                     console.error('Error:', data.message);
                     addMessage('system', `Error: ${data.message}`);
                     break;
+                case 'connection_ready':
+                    console.log('Connection ready:', data.message);
+                    addMessage('system', data.message);
+                    break;
+                default:
+                    console.log('Unhandled message type:', data.type || data.event, data);
             }
         }
 
@@ -197,45 +275,276 @@
             transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
         }
 
-        // Play received audio
-        function playAudio(base64Audio) {
-            const audioData = atob(base64Audio);
-            const audioArray = new Uint8Array(audioData.length);
-            for (let i = 0; i < audioData.length; i++) {
-                audioArray[i] = audioData.charCodeAt(i);
+        // Clear transcript
+        clearButton.addEventListener('click', () => {
+            transcriptDiv.innerHTML = '';
+            clearAudioQueue();
+        });
+
+        // Clear audio queue
+        function clearAudioQueue() {
+            audioBufferQueue = [];
+            audioBufferCache = null;
+            
+            if (currentAudioSource) {
+                try {
+                    currentAudioSource.stop();
+                } catch (e) {
+                    console.log('Audio source already stopped');
+                }
+                currentAudioSource = null;
             }
             
-            const audioBlob = new Blob([audioArray], { type: 'audio/wav' });
-            const audioUrl = URL.createObjectURL(audioBlob);
-            const audio = new Audio(audioUrl);
-            audio.play();
+            isAudioPlaying = false;
+            lastPlayedTime = 0;
+            consecutiveEmptyBuffers = 0;
+            isBuffering = false;
+            silenceDetected = false;
+            
+            updateAudioStatus();
+            console.log('Audio queue cleared');
         }
 
-        // Set up audio recording
+        // Play received audio with proper queue management
+        function playAudio(base64Audio) {
+            try {
+                if (!audioContext) {
+                    audioContext = new AudioContext({ sampleRate: 8000 });
+                }
+
+                // Decode base64 audio data
+                const audioData = atob(base64Audio);
+                const audioArray = new Uint8Array(audioData.length);
+                for (let i = 0; i < audioData.length; i++) {
+                    audioArray[i] = audioData.charCodeAt(i);
+                }
+                
+                // Add to queue
+                addToAudioBufferQueue(audioArray);
+                
+                // Start playing if not already playing
+                if (!isAudioPlaying && audioBufferQueue.length >= BUFFER_LOW_THRESHOLD) {
+                    playNextAudioBuffer();
+                }
+                
+            } catch (error) {
+                console.error('Error processing audio:', error);
+            }
+        }
+
+        // Add audio to buffer queue with management
+        function addToAudioBufferQueue(audioArray) {
+            audioBufferQueue.push(audioArray);
+            audioChunkCount++;
+            
+            // Prevent queue overflow
+            if (audioBufferQueue.length > BUFFER_HIGH_THRESHOLD) {
+                audioBufferQueue.shift();
+                droppedChunkCount++;
+                console.log('Dropped audio chunk to prevent overflow');
+            }
+            
+            updateAudioStatus();
+        }
+
+        // Play next audio buffer in queue
+        function playNextAudioBuffer() {
+            if (audioBufferQueue.length === 0) {
+                consecutiveEmptyBuffers++;
+                
+                if (consecutiveEmptyBuffers >= 5) {
+                    isAudioPlaying = false;
+                    updateAudioStatus();
+                    return;
+                }
+                
+                // Wait and try again
+                setTimeout(() => {
+                    playNextAudioBuffer();
+                }, 100);
+                return;
+            }
+            
+            consecutiveEmptyBuffers = 0;
+            isAudioPlaying = true;
+            updateAudioStatus();
+            
+            const audioArray = audioBufferQueue.shift();
+            
+            // Stop any currently playing audio
+            if (currentAudioSource) {
+                try {
+                    currentAudioSource.stop();
+                } catch (e) {
+                    console.log('Previous audio source already stopped');
+                }
+                currentAudioSource = null;
+            }
+            
+            playAudioWithWebAudio(audioArray);
+        }
+
+        // Play audio using Web Audio API
+        async function playAudioWithWebAudio(audioData) {
+            try {
+                if (!audioContext) {
+                    audioContext = new AudioContext({ sampleRate: 8000 });
+                }
+                
+                // Resume audio context if suspended
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                
+                // Decode g711_ulaw to PCM
+                const pcmData = new Float32Array(audioData.length);
+                for (let i = 0; i < audioData.length; i++) {
+                    pcmData[i] = ulawToLinear(audioData[i]) / 32768.0;
+                }
+                
+                // Create audio buffer at 8kHz
+                const audioBuffer = audioContext.createBuffer(1, pcmData.length, 8000);
+                const channelData = audioBuffer.getChannelData(0);
+                channelData.set(pcmData);
+                
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                
+                // Add compression for better audio quality
+                const compressor = audioContext.createDynamicsCompressor();
+                compressor.threshold.value = -24;
+                compressor.knee.value = 30;
+                compressor.ratio.value = 12;
+                compressor.attack.value = 0.003;
+                compressor.release.value = 0.25;
+                
+                source.connect(compressor);
+                compressor.connect(audioContext.destination);
+                
+                // Set up event handler for when audio ends
+                source.onended = () => {
+                    currentAudioSource = null;
+                    // Play next audio buffer after current one ends
+                    setTimeout(() => {
+                        playNextAudioBuffer();
+                    }, BUFFER_PADDING_MS);
+                };
+                
+                currentAudioSource = source;
+                
+                // Calculate timing for smooth playback
+                const now = audioContext.currentTime;
+                const timeSinceLastPlay = now - lastPlayedTime;
+                
+                if (timeSinceLastPlay > 0.5 || silenceDetected) {
+                    lastPlayedTime = now;
+                    silenceDetected = false;
+                }
+                
+                const startTime = Math.max(now, lastPlayedTime);
+                source.start(startTime);
+                
+                lastPlayedTime = startTime + audioBuffer.duration;
+                
+                console.log('Playing g711_ulaw audio at 8kHz');
+                
+            } catch (error) {
+                console.error('Web Audio API playback failed:', error);
+                currentAudioSource = null;
+                // Continue with next buffer even if current one fails
+                setTimeout(() => {
+                    playNextAudioBuffer();
+                }, 100);
+            }
+        }
+        
+        // Convert μ-law to linear PCM
+        function ulawToLinear(ulaw) {
+            ulaw = ~ulaw;
+            const sign = (ulaw & 0x80) ? -1 : 1;
+            const exponent = (ulaw >> 4) & 0x07;
+            const mantissa = ulaw & 0x0F;
+            
+            let sample = (mantissa << (exponent + 3)) + (0x84 << exponent);
+            if (exponent === 0) sample += 0x84;
+            
+            return sign * (sample - 0x84);
+        }
+
+        // Convert linear PCM to μ-law
+        function linearToUlaw(pcm) {
+            const BIAS = 0x84;
+            const CLIP = 32635;
+            
+            let sign = (pcm >> 8) & 0x80;
+            if (sign !== 0) pcm = -pcm;
+            if (pcm > CLIP) pcm = CLIP;
+            
+            pcm += BIAS;
+            let exponent = 7;
+            let expMask = 0x4000;
+            
+            for (let i = 0; i < 8; i++) {
+                if ((pcm & expMask) !== 0) break;
+                exponent--;
+                expMask >>= 1;
+            }
+            
+            const mantissa = (pcm >> (exponent + 3)) & 0x0F;
+            const ulaw = ~(sign | (exponent << 4) | mantissa);
+            
+            return ulaw & 0xFF;
+        }
+
+        // Set up audio recording using Web Audio API for better control
         async function setupAudioRecording() {
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                audioContext = new AudioContext();
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 8000,  // Use 8kHz for g711_ulaw compatibility
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+                
+                audioContext = new AudioContext({ sampleRate: 8000 });
                 analyser = audioContext.createAnalyser();
                 const source = audioContext.createMediaStreamSource(stream);
                 source.connect(analyser);
                 
-                mediaRecorder = new MediaRecorder(stream);
+                // Create a ScriptProcessorNode for real-time audio processing
+                const processor = audioContext.createScriptProcessor(1024, 1, 1);
+                source.connect(processor);
+                processor.connect(audioContext.destination);
                 
-                mediaRecorder.ondataavailable = (event) => {
-                    if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-                        // Convert to base64 and send
-                        const reader = new FileReader();
-                        reader.onloadend = () => {
-                            const base64Audio = reader.result.split(',')[1];
-                            ws.send(JSON.stringify({
-                                type: 'audio',
-                                audio: base64Audio
-                            }));
-                        };
-                        reader.readAsDataURL(event.data);
+                processor.onaudioprocess = (event) => {
+                    if (isRecording && ws && ws.readyState === WebSocket.OPEN) {
+                        const inputBuffer = event.inputBuffer;
+                        const inputData = inputBuffer.getChannelData(0);
+                        
+                        // Convert float32 audio to g711_ulaw format
+                        const ulawData = new Uint8Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            // Convert from [-1, 1] to 16-bit PCM first
+                            const pcm = Math.max(-32768, Math.min(32767, inputData[i] * 32767));
+                            // Convert PCM to μ-law
+                            ulawData[i] = linearToUlaw(pcm);
+                        }
+                        
+                        // Convert to base64
+                        const base64Audio = btoa(String.fromCharCode(...ulawData));
+                        
+                        // Send to server
+                        ws.send(JSON.stringify({ 
+                            type: 'audio',
+                            audio: base64Audio
+                        }));
                     }
                 };
+                
+                // Store processor for cleanup
+                window.audioProcessor = processor;
 
                 setupVisualizer();
                 return true;
@@ -247,6 +556,8 @@
 
         // Set up audio visualizer
         function setupVisualizer() {
+            if (!analyser) return;
+            
             analyser.fftSize = 2048;
             const bufferLength = analyser.frequencyBinCount;
             const dataArray = new Uint8Array(bufferLength);
@@ -298,7 +609,7 @@
                 return;
             }
 
-            if (!mediaRecorder) {
+            if (!window.audioProcessor) {
                 const success = await setupAudioRecording();
                 if (!success) {
                     alert('Could not access microphone');
@@ -308,19 +619,38 @@
 
             if (isRecording) {
                 // Stop recording
-                mediaRecorder.stop();
+                isRecording = false;
                 recordButton.textContent = 'Start Recording';
                 recordButton.classList.remove('recording');
-                ws.send(JSON.stringify({ type: 'end_speaking' }));
+                
+                // Send commit to finish the audio buffer
+                ws.send(JSON.stringify({ 
+                    type: 'input_audio_buffer.commit'
+                }));
+                
+                // Request a response from the server
+                ws.send(JSON.stringify({ 
+                    type: 'response.create'
+                }));
+                
+                console.log('Stopped recording and requested response');
+                addMessage('system', 'Recording stopped, processing...');
             } else {
+                // Clear any existing audio buffer and playback before starting
+                clearAudioQueue();
+                
+                ws.send(JSON.stringify({ 
+                    type: 'input_audio_buffer.clear'
+                }));
+                
                 // Start recording
-                mediaRecorder.start(100); // Send data every 100ms
+                isRecording = true;
                 recordButton.textContent = 'Stop Recording';
                 recordButton.classList.add('recording');
-                ws.send(JSON.stringify({ type: 'start_speaking' }));
+                
+                console.log('Started recording');
+                addMessage('system', 'Recording started...');
             }
-            
-            isRecording = !isRecording;
         });
 
         // Handle window resize for visualizer
@@ -329,9 +659,20 @@
             visualizer.height = visualizer.offsetHeight;
         });
 
+        // Handle window unload
+        window.addEventListener('beforeunload', () => {
+            clearAudioQueue();
+            if (ws) {
+                ws.close();
+            }
+        });
+
         // Initial setup
         visualizer.width = visualizer.offsetWidth;
         visualizer.height = visualizer.offsetHeight;
+
+        // Initialize audio status
+        updateAudioStatus();
     </script>
 </body>
 </html>

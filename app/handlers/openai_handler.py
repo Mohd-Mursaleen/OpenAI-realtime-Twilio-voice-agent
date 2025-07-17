@@ -8,6 +8,7 @@ from fastapi import WebSocket
 
 # handlers imports
 from app.handlers.stream_state import StreamState
+import time
 from app.handlers.tools.tool_response import send_tool_result
 
 
@@ -84,33 +85,51 @@ class OpenAIMessageHandler:
     async def _handle_audio_delta(self, response: dict):
         """Processes audio delta responses from OpenAI."""
         try:
-            # Check for both possible audio data formats with minimal overhead
-            audio_data = response.get('delta') or response.get('audio')
+            # Check if WebSocket is still connected
+            if self.websocket.client_state.name != 'CONNECTED':
+                logger.debug("WebSocket not connected, skipping audio delta")
+                return
+                
+            # OpenAI sends audio data in the 'delta' field for audio deltas
+            audio_data = response.get('delta')
                 
             if not audio_data:
-                logger.warning("Audio delta missing audio data in both 'delta' and 'audio' fields")
+                logger.warning("Audio delta missing audio data in 'delta' field")
+                logger.debug(f"Response structure: {list(response.keys())}")
                 return
                 
             # Track audio chunks with minimal logging
             if not hasattr(self, '_audio_chunk_count'):
                 self._audio_chunk_count = 0
+                logger.info("Starting to receive audio chunks from OpenAI")
             self._audio_chunk_count += 1
                 
             # Only log occasionally to reduce overhead
-            if self._audio_chunk_count % 100 == 0:
+            if self._audio_chunk_count % 50 == 0:
                 logger.info(f"Processed {self._audio_chunk_count} audio chunks")
                 
-            # Send the audio data to client
-            await self.websocket.send_json({
-                "type": "audio",
-                "audio": audio_data  # Already base64 encoded
-            })
+            # Send the audio data to client with error handling
+            try:
+                await self.websocket.send_json({
+                    "type": "audio",
+                    "audio": audio_data  # Already base64 encoded from OpenAI
+                })
+            except RuntimeError as e:
+                if "websocket.close" in str(e):
+                    logger.info("WebSocket closed, stopping audio transmission")
+                    return
+                else:
+                    raise
             
+            # Update state tracking
             if response.get('item_id'):
                 self.state.last_assistant_item = response['item_id']
 
             if self.state.response_start_time is None:
                 self.state.response_start_time = self.state.latest_timestamp
+                
+            # Mark assistant as speaking
+            self.state.is_assistant_speaking = True
             
         except Exception as e:
             logger.error(f"Error handling audio delta: {e}", exc_info=True)
@@ -141,26 +160,36 @@ class OpenAIMessageHandler:
             logger.error(f"Error handling speech stopped: {e}", exc_info=True)
 
     async def _handle_interruption(self):
-        """Handles interruption of assistant's speech."""
+        """Handles interruption of assistant's speech with improved logic."""
         try:
-            if self.state.last_assistant_item:
-                # Calculate elapsed time
-                elapsed_time = self.state.get_current_timestamp() - self.state.response_start_time
+            if not self.state.last_assistant_item or not self.state.response_start_time:
+                logger.debug("No active assistant speech to interrupt")
+                return
                 
-                # Send truncate event to OpenAI
-                truncate_event = {
-                    "type": "conversation.item.truncate",
-                    "item_id": self.state.last_assistant_item,
-                    "content_index": 0,
-                    "audio_end_ms": elapsed_time
-                }
-                await self.openai_client.send(truncate_event)
+            # Calculate elapsed time more accurately
+            elapsed_time = self.state.get_current_timestamp() - self.state.response_start_time
+            
+            # Only interrupt if there's been sufficient audio (avoid truncation errors)
+            if elapsed_time < 500:  # Less than 500ms, too short to truncate
+                logger.debug(f"Skipping interruption, audio too short: {elapsed_time}ms")
+                return
                 
-                # Reset state
-                self.state.last_assistant_item = None
-                self.state.response_start_time = None
-                self.state.is_assistant_speaking = False
-                
+            logger.info(f"Interrupting assistant speech at {elapsed_time}ms")
+            
+            # Send truncate event to OpenAI
+            truncate_event = {
+                "type": "conversation.item.truncate",
+                "item_id": self.state.last_assistant_item,
+                "content_index": 0,
+                "audio_end_ms": int(elapsed_time)
+            }
+            await self.openai_client.send(truncate_event)
+            
+            # Reset state
+            self.state.last_assistant_item = None
+            self.state.response_start_time = None
+            self.state.is_assistant_speaking = False
+            
         except Exception as e:
             logger.error(f"Error handling interruption: {e}", exc_info=True)
 
