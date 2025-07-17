@@ -32,6 +32,9 @@ class OpenAIMessageHandler:
         self.websocket = websocket
         self.state = state
         self.openai_client = openai_client
+        # Track actual audio duration for interruption handling
+        self.audio_duration_ms = 0
+        self.audio_start_time = None
 
     async def process_response(self, response: dict):
         """Routes OpenAI responses to appropriate handlers."""
@@ -61,6 +64,8 @@ class OpenAIMessageHandler:
                 logger.debug(f"Function call arguments delta: {response.get('delta', {})}")
             elif response_type == 'response.function_call_arguments.done':
                 await self._handle_function_call(response)
+            elif response_type == 'response.done':
+                await self._handle_response_done(response)
             elif response_type == 'error':
                 await self._handle_error(response)
             else:
@@ -102,11 +107,21 @@ class OpenAIMessageHandler:
             if not hasattr(self, '_audio_chunk_count'):
                 self._audio_chunk_count = 0
                 logger.info("Starting to receive audio chunks from OpenAI")
+                # Reset audio tracking when new audio starts
+                self.audio_duration_ms = 0
+                self.audio_start_time = time.time() * 1000  # Convert to milliseconds
+            
             self._audio_chunk_count += 1
+            
+            # Estimate audio duration based on chunk count and timing
+            # This is a rough estimate - each chunk is typically ~20ms of audio
+            current_time = time.time() * 1000
+            if self.audio_start_time:
+                self.audio_duration_ms = current_time - self.audio_start_time
                 
             # Only log occasionally to reduce overhead
             if self._audio_chunk_count % 50 == 0:
-                logger.info(f"Processed {self._audio_chunk_count} audio chunks")
+                logger.info(f"Processed {self._audio_chunk_count} audio chunks, estimated duration: {self.audio_duration_ms:.0f}ms")
                 
             # Send the audio data to client with error handling
             try:
@@ -162,36 +177,55 @@ class OpenAIMessageHandler:
     async def _handle_interruption(self):
         """Handles interruption of assistant's speech with improved logic."""
         try:
-            if not self.state.last_assistant_item or not self.state.response_start_time:
+            if not self.state.last_assistant_item:
                 logger.debug("No active assistant speech to interrupt")
                 return
                 
-            # Calculate elapsed time more accurately
-            elapsed_time = self.state.get_current_timestamp() - self.state.response_start_time
+            # Use the actual audio duration we've been tracking
+            actual_audio_duration = self.audio_duration_ms
             
-            # Only interrupt if there's been sufficient audio (avoid truncation errors)
-            if elapsed_time < 500:  # Less than 500ms, too short to truncate
-                logger.debug(f"Skipping interruption, audio too short: {elapsed_time}ms")
+            # Only interrupt if there's been sufficient audio
+            if actual_audio_duration < 400:  # Less than 500ms, too short to truncate
+                logger.debug(f"Skipping interruption, audio too short: {actual_audio_duration:.0f}ms")
                 return
                 
-            logger.info(f"Interrupting assistant speech at {elapsed_time}ms")
+            # Use 90% of actual duration to ensure we don't exceed the audio length
+            safe_truncate_time = max(100, actual_audio_duration * 0.9)
+            
+            logger.info(f"Interrupting assistant speech at {safe_truncate_time:.0f}ms (actual duration: {actual_audio_duration:.0f}ms)")
             
             # Send truncate event to OpenAI
             truncate_event = {
                 "type": "conversation.item.truncate",
                 "item_id": self.state.last_assistant_item,
                 "content_index": 0,
-                "audio_end_ms": int(elapsed_time)
+                "audio_end_ms": int(safe_truncate_time)
             }
             await self.openai_client.send(truncate_event)
             
             # Reset state
-            self.state.last_assistant_item = None
-            self.state.response_start_time = None
-            self.state.is_assistant_speaking = False
+            self._reset_audio_tracking()
             
         except Exception as e:
             logger.error(f"Error handling interruption: {e}", exc_info=True)
+
+    async def _handle_response_done(self, response: dict):
+        """Handle response completion from OpenAI."""
+        try:
+            logger.info("Response completed")
+            self._reset_audio_tracking()
+        except Exception as e:
+            logger.error(f"Error handling response done: {e}", exc_info=True)
+
+    def _reset_audio_tracking(self):
+        """Reset audio tracking state."""
+        self.state.last_assistant_item = None
+        self.state.response_start_time = None
+        self.state.is_assistant_speaking = False
+        self.audio_duration_ms = 0
+        self.audio_start_time = None
+        if hasattr(self, '_audio_chunk_count'):
+            delattr(self, '_audio_chunk_count')
 
     async def _handle_text_delta(self, response: dict):
         """Handle text delta responses from OpenAI."""
@@ -235,6 +269,12 @@ class OpenAIMessageHandler:
         try:
             error_msg = response.get('error', {}).get('message', 'Unknown error')
             logger.error(f"OpenAI error: {error_msg}")
+            
+            # If it's an interruption error, reset state and continue
+            if "already shorter than" in error_msg:
+                logger.info("Interruption timing error, resetting state")
+                self._reset_audio_tracking()
+                return
             
             await self.websocket.send_json({
                 "type": "error",

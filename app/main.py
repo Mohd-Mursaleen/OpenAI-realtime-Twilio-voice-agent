@@ -1,13 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import os
 import logging
 import sys
 from contextlib import asynccontextmanager
-from app.client.pool_instance import client_pool, schedule_health_check
 from app.router import router as agent_router
-
+from app.client.client import OpenAIWebSocketClient
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -24,19 +22,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Startup events
     try:
-        logger.info("Starting up Voice Agent API...")
-        
-        # Pre-initialize the client pool - await it to ensure completion
-        logger.info("Initializing OpenAI client pool...")
-        await client_pool.initialize()
-        logger.info("OpenAI client pool initialized successfully")
-        
-        # Start the health check task
-        logger.info("Starting health check background task...")
-        schedule_health_check()
-        logger.info("Health check task scheduled")
-        
+        logger.info("Initializing OpenAI client...")
+        client = OpenAIWebSocketClient()
+        await client.connect()        
         logger.info("Startup complete - server ready to accept requests")
+
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         # Re-raise to prevent server from starting if critical initialization fails
@@ -48,8 +38,8 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Shutting down Voice Agent API...")
         # Close all connections
-        await client_pool.close_all()
-        logger.info("All OpenAI client connections closed")
+        await client.close()
+        logger.info("OpenAI client connections closed")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
 
