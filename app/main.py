@@ -18,39 +18,38 @@ logging.basicConfig(
 # Get logger
 logger = logging.getLogger(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup events
-    try:
-        logger.info("Initializing OpenAI client...")
-        client = OpenAIWebSocketClient()
-        await client.connect()        
-        logger.info("Startup complete - server ready to accept requests")
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     # Startup events
+#     try:
+#         logger.info("Initializing OpenAI client...")
+#         client = OpenAIWebSocketClient()
+#         await client.connect()        
+#         logger.info("Startup complete - server ready to accept requests")
 
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
-        # Re-raise to prevent server from starting if critical initialization fails
-        raise
+#     except Exception as e:
+#         logger.error(f"Error during startup: {e}")
+#         # Re-raise to prevent server from starting if critical initialization fails
+#         raise
     
-    yield
+#     yield
     
-    # Shutdown events
-    try:
-        logger.info("Shutting down Voice Agent API...")
-        # Close all connections
-        await client.close()
-        logger.info("OpenAI client connections closed")
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+#     # Shutdown events
+#     try:
+#         logger.info("Shutting down Voice Agent API...")
+#         # Close all connections
+#         await client.close()
+#         logger.info("OpenAI client connections closed")
+#     except Exception as e:
+#         logger.error(f"Error during shutdown: {e}")
 
 # Initialize FastAPI app
 app = FastAPI(
     title="Voice Agent API",
     description="Voice agent services for handling voice interactions using OpenAI",
     version="1.0.0",
-    lifespan=lifespan,
+    # lifespan=lifespan,
 )
-logger.info("Adding CORS middleware...")
 # Configure CORS - Simple configuration for development
 app.add_middleware(
     CORSMiddleware,
@@ -59,7 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-logger.info("CORS middleware added successfully")
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 

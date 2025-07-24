@@ -10,7 +10,7 @@ from app.client.pool_instance import client_pool
 from app.handlers.stream_state import StreamState
 from app.handlers.openai_handler import OpenAIMessageHandler
 import json
-
+from app.client.client import OpenAIWebSocketClient
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -26,17 +26,9 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted")
     
-    # Get a client from the pool
-    openai_client = await client_pool.get_client()
-    
-    if not openai_client:
-        logger.error("No available OpenAI clients")
-        await websocket.send_json({
-            "event": "error",
-            "message": "No available OpenAI clients"
-        })
-        await websocket.close(code=1013, reason="No available OpenAI clients")
-        return
+    logger.info("Initializing OpenAI client...")
+    openai_client = OpenAIWebSocketClient()
+    await openai_client.connect()  
     
     # Create stream state
     state = StreamState()
